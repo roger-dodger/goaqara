@@ -29,83 +29,171 @@ const (
 )
 
 type AqaraRequest struct {
-	Intent string    `json:"intent"`
-	Data   AqaraData `json:"data"`
-}
-
-type AqaraData interface {
+	Intent string      `json:"intent"`
+	Data   interface{} `json:"data"`
 }
 
 type AqaraResponse struct {
-	Code          int         `json:"code"`
-	RequestID     string      `json:"requestId"`
-	Message       string      `json:"message"`
-	MessageDetail string      `json:"messageDetail"`
-	Result        AqaraResult `json:"result"`
-}
-
-type AqaraResult interface {
+	Code          int             `json:"code"`
+	RequestID     string          `json:"requestId"`
+	Message       string          `json:"message"`
+	MessageDetail string          `json:"messageDetail"`
+	Result        json.RawMessage `json:"result"`
 }
 
 type AqaraClient struct {
-	region AqaraRegionServer
-	appID  string
-	keyID  string
-	appKey string
+	region       AqaraRegionServer
+	appID        string
+	keyID        string
+	appKey       string
+	account      string
+	accessToken  string
+	refreshToken string
+	debug        bool
 }
 
 // New returns a new AqaraClient.
-func New(region AqaraRegionServer, appID, keyID, appKey string) *AqaraClient {
+func New(region AqaraRegionServer, appID, keyID, appKey, account string, debug bool) *AqaraClient {
 	return &AqaraClient{
-		region: region,
-		appID:  appID,
-		keyID:  keyID,
-		appKey: appKey,
+		region:       region,
+		appID:        appID,
+		keyID:        keyID,
+		appKey:       appKey,
+		account:      account,
+		accessToken:  "", // updated after login
+		refreshToken: "", // updated after login
+		debug:        debug,
 	}
 }
 
-// Auth will request a new authorization code for a given Aqara account.
-func (a *AqaraClient) Auth(account string) {
+// GetAuthCode will request a new authorization code for a given Aqara account.
+func (a *AqaraClient) GetAuthCode() {
 	type Data struct {
 		Account             string `json:"account"`
 		AccountType         int    `json:"accountType"`
 		AccessTokenValidity string `json:"accessTokenValidity"`
 	}
 
-	data := Data{
-		Account:             account,
-		AccountType:         0,
-		AccessTokenValidity: "1h",
+	request := AqaraRequest{
+		Intent: "config.auth.getAuthCode",
+		Data: Data{
+			Account:             a.account,
+			AccountType:         0,
+			AccessTokenValidity: "1h",
+		},
+	}
+
+	response := AqaraResponse{}
+
+	if err := a.apiCall(request, &response, false); err != nil {
+		log.Printf("Failed to do auth request: %v", err)
+	}
+}
+
+// GetToken exchanges the authorization code for an access token.
+func (a *AqaraClient) GetToken(authCode string) {
+	type Data struct {
+		AuthCode    string `json:"authCode"`
+		Account     string `json:"account"`
+		AccountType int    `json:"accountType"`
 	}
 
 	request := AqaraRequest{
-		Intent: "config.auth.getAuthCode",
-		Data:   data,
+		Intent: "config.auth.getToken",
+		Data: Data{
+			AuthCode:    authCode,
+			Account:     a.account,
+			AccountType: 0,
+		},
 	}
 
-	type Result struct {
-		AuthCode string `json:"authCode"`
+	response := AqaraResponse{}
+
+	if err := a.apiCall(request, &response, false); err != nil {
+		log.Printf("Failed to do token request: %v", err)
 	}
 
-	result := Result{}
-	response := AqaraResponse{
-		Result: result,
+	if response.Code == 0 {
+		log.Printf("Login successful, updating account information")
+
+		type Result struct {
+			ExpiresIn    string `json:"expiresIn"`
+			OpenID       string `json:"openId"`
+			AccessToken  string `json:"accessToken"`
+			RefreshToken string `json:"refreshToken"`
+		}
+
+		var result Result
+		if err := json.Unmarshal(response.Result, &result); err != nil {
+			log.Printf("Failed to unmarshal result: %v", err)
+		}
+
+		a.accessToken = result.AccessToken
+		a.refreshToken = result.RefreshToken
+	}
+}
+
+// GetDevices retreives all devices for a certain account.
+func (a *AqaraClient) GetDevices() {
+	type Data struct {
+		DeviceIDs  []string `json:"dids"`
+		PositionID string   `json:"positionId"`
+		PageNum    int      `json:"pageNum"`
+		PageSize   int      `json:"pageSize"`
 	}
 
-	err := a.apiCall(request, &response)
-	if err != nil {
-		log.Printf("Failed to do auth request: %v", err)
+	request := AqaraRequest{
+		Intent: "query.device.info",
+		Data: Data{
+			DeviceIDs:  []string{},
+			PositionID: "",
+			PageNum:    1,
+			PageSize:   100,
+		},
+	}
+
+	response := AqaraResponse{}
+
+	if err := a.apiCall(request, &response, true); err != nil {
+		log.Printf("Failed query devices: %v", err)
+	}
+
+	if response.Code == 0 {
+		type Device struct {
+			DID             string `json:"did"`
+			ParentDID       string `json:"parentDid"`
+			PositionID      string `json:"positionId"`
+			CreateTime      string `json:"createTime"`
+			UpdateTime      string `json:"updateTime"`
+			Model           string `json:"model"`
+			ModelType       int    `json:"modelType"`
+			State           int    `json:"state"`
+			FirmwareVersion string `json:"firmwareVersion"`
+			DeviceName      string `json:"deviceName"`
+			TimeZone        string `json:"timeZone"`
+		}
+
+		type Result struct {
+			Data       []Device `json:"data"`
+			TotalCount int      `json:"totalCount"`
+		}
+
+		var result Result
+		if err := json.Unmarshal(response.Result, &result); err != nil {
+			log.Printf("Failed to unmarshal result: %v", err)
+		}
+
+		log.Printf("Number of devices received: %v", result.TotalCount)
+		for _, device := range result.Data {
+			fmt.Printf("Device Name:  %v", device.DeviceName)
+			fmt.Printf("Device Model: %v", device.Model)
+		}
 	}
 }
 
 // apiCall sends request to the Aqara API with the provided AqaraRequest (intent).
 // Response is updated in the provided AqaraResponse pointer.
-func (a *AqaraClient) apiCall(aqaraRequest AqaraRequest, aqaraResponse *AqaraResponse) error {
-	nonce := getNonce(nonceLength)
-	timestamp := getTimestamp()
-
-	// TODO: accessToken needs to be set for authenticated requests (intents).
-	signature := a.sign("", nonce, timestamp)
+func (a *AqaraClient) apiCall(aqaraRequest AqaraRequest, aqaraResponse *AqaraResponse, authenticated bool) error {
 
 	const apiEndpoint = "/v3.0/open/api"
 	url := fmt.Sprintf("https://%s%s", a.region, apiEndpoint)
@@ -120,6 +208,16 @@ func (a *AqaraClient) apiCall(aqaraRequest AqaraRequest, aqaraResponse *AqaraRes
 	if err != nil {
 		log.Printf("Failed to prepare request: %v", err)
 		return err
+	}
+
+	nonce := getNonce(nonceLength)
+	timestamp := getTimestamp()
+	var signature string
+	if authenticated {
+		request.Header.Add("Accesstoken", a.accessToken)
+		signature = a.sign(a.accessToken, nonce, timestamp)
+	} else {
+		signature = a.sign("", nonce, timestamp)
 	}
 
 	request.Header.Add("Content-Type", "application/json")
@@ -153,8 +251,12 @@ func (a *AqaraClient) apiCall(aqaraRequest AqaraRequest, aqaraResponse *AqaraRes
 		}
 
 		if aqaraResponse.Code != 0 {
-			log.Printf("Aqara response code %v received with message %v", aqaraResponse.Code, aqaraResponse.MessageDetail)
+			log.Printf("Aqara response with code %v received with message %v", aqaraResponse.Code, aqaraResponse.MessageDetail)
 			return fmt.Errorf("request against Aqara API failed with code: %v", aqaraResponse.Code)
+		}
+
+		if a.debug {
+			log.Printf("**DEBUG**: %v", string(responseBody))
 		}
 
 		return nil
